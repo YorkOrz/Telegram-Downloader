@@ -1,8 +1,12 @@
 ﻿using System.Security.Cryptography;
+using System.Text;
 using ByteSizeLib;
+using HeyRed.Mime;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion.Internal;
 using Microsoft.Extensions.Logging;
 using Spectre.Console;
+using Starksoft.Net.Proxy;
 using TelegramGroupFileDownloader;
 using TelegramGroupFileDownloader.Config;
 using TelegramGroupFileDownloader.Database;
@@ -27,7 +31,7 @@ try
 {
     var debug = args.Contains("-d");
     AnsiConsole.Write(
-        new FigletText("Telegram Group Downloader")
+        new FigletText("Telegram Downloader")
             .Centered()
             .Color(Color.Orange1));
     await AnsiConsole.Status()
@@ -72,14 +76,18 @@ try
         ConfigurationManager.SaveConfiguration(config);
     }
 
+    var searchKey = string.IsNullOrEmpty(config.SearchKey) ? string.Empty : $"#{config.SearchKey}";
+    AnsiConsole.MarkupLine("[blue]Config: [/]");
+    AnsiConsole.MarkupLine("    PhoneNumber: [yellow]{0}[/]", config.PhoneNumber!);
+    AnsiConsole.MarkupLine("    SessionPath: [yellow]{0}[/]", config.SessionPath);
+    AnsiConsole.MarkupLine("    DownloadPath: [yellow]{0}[/]", config.DownloadPath);
+    AnsiConsole.MarkupLine("    GroupName: [yellow]{0}[/]", config.GroupName!);
+    AnsiConsole.MarkupLine("    SearchKey: [yellow]{0}[/]", searchKey);
+    if (!string.IsNullOrEmpty(config.Socks5Host) && config.Socks5Port > 0)
+        AnsiConsole.MarkupLine("    Socks5Proxy: [yellow]{0}:{1}[/]", config.Socks5Host, config.Socks5Port);
+    AnsiConsole.MarkupLine("    DocumentExtensionFilter: [yellow]{0}[/]", config.DocumentExtensionFilter!);
     if (debug)
     {
-        AnsiConsole.MarkupLine("[blue]DEBUG: Config[/]");
-        AnsiConsole.MarkupLine("CONFIG__PHONENUMBER: [yellow]{0}[/]", config.PhoneNumber!);
-        AnsiConsole.MarkupLine("CONFIG__SESSIONPATH: [yellow]{0}[/]", config.SessionPath);
-        AnsiConsole.MarkupLine("CONFIG__DOWNLOADPATH: [yellow]{0}[/]", config.DownloadPath);
-        AnsiConsole.MarkupLine("CONFIG__GROUPNAME: [yellow]{0}[/]", config.GroupName!);
-        AnsiConsole.MarkupLine("CONFIG__DOCUMENTEXTENSIONFILTER: [yellow]{0}[/]", config.DocumentExtensionFilter!);
         WTelegram.Helpers.Log = (lvl, str) =>
             AnsiConsole.MarkupLineInterpolated($"WTelegram: {Enum.GetName(typeof(LogLevel), lvl)} - {str}");
     }
@@ -97,12 +105,36 @@ try
     client.PingInterval = 60;
     client.MaxAutoReconnects = 30;
     //client.FilePartSize = 10240;
+    if (!string.IsNullOrEmpty(config.Socks5Host) && config.Socks5Port > 0)
+    {
+        client.TcpHandler = (address, port) =>
+        {
+            var proxy = new Socks5ProxyClient(config.Socks5Host, config.Socks5Port);
+            return Task.FromResult(proxy.CreateConnection(address, port));
+        };
+    }
     await client.LoginUserIfNeeded();
     var groups = await client.Messages_GetAllChats();
-    var group = (Channel)groups.chats.First(x => x.Value.Title == config.GroupName && x.Value.IsActive).Value;
+    Channel? group = null;
+    try
+    {
+        group = (Channel)groups.chats.First(x => x.Value.Title.Contains(config.GroupName) && x.Value.IsActive).Value;
+    }
+    catch (Exception)
+    {
+        AnsiConsole.MarkupLine($"[red]Not Found the group {config.GroupName}[/]");
+        return;
+    }
     var hc = client.GetAccessHashFor<Channel>(group.ID);
-    var msgs = await client.Messages_Search(new InputPeerChannel(group.ID, hc), string.Empty,
-        new InputMessagesFilterDocument());
+    var channel = new InputPeerChannel(group.ID, hc);
+
+    var totalGroupFiles = 0;
+    var dicMsg = new Dictionary<MessagesFilter, int>();
+    totalGroupFiles += await getMsgFilterCount(searchKey, client, channel, new InputMessagesFilterPhotos(), "Photos", dicMsg);
+    totalGroupFiles += await getMsgFilterCount(searchKey, client, channel, new InputMessagesFilterVideo(), "Videos", dicMsg);
+    totalGroupFiles += await getMsgFilterCount(searchKey, client, channel, new InputMessagesFilterGif(), "Gifs", dicMsg);
+    totalGroupFiles += await getMsgFilterCount(searchKey, client, channel, new InputMessagesFilterDocument(), "Documents", dicMsg);
+
     var delete = args.Contains("--delete");
     try
     {
@@ -114,7 +146,6 @@ try
         delete = false;
     }
 
-    var totalGroupFiles = msgs.Count;
     var downloadedFiles = 0;
     var duplicateFiles = 0;
     var filteredFiles = 0;
@@ -128,277 +159,330 @@ try
         .HideHeaders();
     table.AddColumn("1");
     table.Columns[0].NoWrap = true;
-    var textData = Markup.FromInterpolated($"Found [green]{totalGroupFiles}[/] Documents");
+    var textData = Markup.FromInterpolated($"Found [green]{totalGroupFiles}[/] Files");
     logs = AddLog(logs, textData);
     table = BuildTable(table, logs, totalGroupFiles, 0, 0, 0, 0, 0);
-    var channel = new InputPeerChannel(group.ID, hc);
     await AnsiConsole.Live(table)
         .StartAsync(async ctx =>
         {
             ctx.Refresh();
-            for (var i = 0; i <= totalGroupFiles; i += 100)
+            foreach (var item in dicMsg)
             {
-                msgs = await client.Messages_Search(channel, string.Empty,
-                    new InputMessagesFilterDocument(), offset_id: 0, limit: 100, add_offset: i);
-                foreach (var msg in msgs.Messages)
+                for (var i = 0; i <= item.Value; i += 100)
                 {
-                    if (msg is not Message { media: MessageMediaDocument { document: Document document } })
+                    var msgs = await client.Messages_Search(channel, searchKey, item.Key, offset_id: 0, limit: 100, add_offset: i);
+                    foreach (var groupMainMsg in msgs.Messages)
                     {
-                        erroredFiles++;
-                        var message = (Message)msg;
-                        var link = await client.Channels_ExportMessageLink(channel, message.ID);
-                        var logMsg =
-                            Markup.FromInterpolated(
-                                $"[yellow] Error: {link.link} [/]|[orange1] Message: {message.message}[/]");
-                        if (delete)
+                        var groupId = ((Message)groupMainMsg).grouped_id;
+                        var msgList = new List<MessageBase>();
+                        if (!string.IsNullOrEmpty(searchKey))
                         {
-                            await client.DeleteMessages(channel, message.ID);
-                            Utilities.WriteLogToFile(errorLogFilePath,
-                                $"Error: Message: {message.message} | Deleting Message");
-                            logMsg =
-                                Markup.FromInterpolated(
-                                    $"[red] Error: Delete Enabled Removing[/] | [orange1]Message: {message.message}[/]");
+                            msgList.AddRange((await client.Messages_Search(channel, string.Empty, offset_id: groupMainMsg.ID + 50)).Messages);
                         }
                         else
                         {
-                            Utilities.WriteLogToFile(errorLogFilePath,
-                                $"Error: {link.link} | Message: {message.message}");
+                            msgList.Add(groupMainMsg);
                         }
-
-                        logs = AddLog(logs, logMsg);
-                        table = BuildTable(
-                            table,
-                            logs,
-                            totalGroupFiles,
-                            downloadedFiles,
-                            duplicateFiles,
-                            filteredFiles,
-                            existingFiles,
-                            erroredFiles);
-                        ctx.Refresh();
-                        continue;
-                    }
-
-                    var sanitizedName = RemoveNewlinesFromPath(document.Filename);
-                    var info = new FileInfo(config.DownloadPath + $"/{sanitizedName}");
-                    var wanted = config.DocumentExtensionFilter!.Split(",");
-                    if (wanted.Length > 0 && !wanted.Contains(info.Extension.Replace(".", "").ToLower()))
-                    {
-                        filteredFiles++;
-                        var link = await client.Channels_ExportMessageLink(channel, msg.ID);
-                        Utilities.WriteLogToFile(filteredLogFilePath, $"{info.Name} | {link.link}");
-                        logs = AddLog(logs,
-                            Markup.FromInterpolated($"Skipping Filtered: {link.link} | [red]{sanitizedName}[/]"));
-                        table = BuildTable(
-                            table,
-                            logs,
-                            totalGroupFiles,
-                            downloadedFiles,
-                            duplicateFiles,
-                            filteredFiles,
-                            existingFiles,
-                            erroredFiles);
-                        ctx.Refresh();
-                        continue;
-                    }
-
-                    var choice = await DocumentManager.DecidePreDownload(info, document.ID, document.size);
-                    switch (choice)
-                    {
-                        case PreDownloadProcessingDecision.Update:
+                        foreach (var msg in msgList)
                         {
-                            await using var db = new DocumentContext();
-                            var uHash = GetFileHash(info.FullName);
-                            if (await db.DocumentFiles.AnyAsync(x => x.Hash == uHash))
-                                break;
-                            await db.DocumentFiles.AddAsync(new DocumentFile()
+                            if (msg is not Message)
+                            {
+                                continue;
+                            }
+                            var message = (Message)msg;
+                            if (groupId != message.grouped_id)
+                            {
+                                continue;
+                            }
+                            var size = 0L;
+                            var docId = 0L;
+                            IObject? document = null;
+                            var fileName = $"{msg.Date.AddHours(8):yyyy-MM-dd_HH_mm_ss}_{msg.ID}_{channel.channel_id}{(string.IsNullOrEmpty(message.message) ? "" : ("_" + message.message))}";
+                            var ext = ".png";
+                            if (msg is Message m && m.media is MessageMediaDocument mmd && mmd.document is Document d)
+                            {
+                                document = d;
+                                size = d.size;
+                                docId = d.ID;
+                                if (!string.IsNullOrEmpty(d.Filename) && d.Filename.IndexOf(".") >= 0)
+                                {
+                                    var strList = d.Filename.Split('.').ToList();
+                                    ext = $".{strList[^1]}";
+                                    strList.RemoveAt(strList.Count - 1);
+                                    fileName += $"_{string.Join(".", strList)}";
+                                }
+                                else
+                                {
+                                    ext = MimeTypesMap.GetExtension(d.mime_type);
+                                }
+                            }
+                            else if (msg is Message { media: MessageMediaPhoto { photo: Photo p } })
+                            {
+                                document = p;
+                                size = p.LargestPhotoSize.FileSize;
+                                docId = p.ID;
+                            }
+                            else
+                            {
+                                erroredFiles++;
+                                var link = await client.Channels_ExportMessageLink(channel, message.ID);
+                                var logMsg =
+                                    Markup.FromInterpolated(
+                                        $"[yellow] Error: {link.link} [/]|[orange1] Message: {message.message}[/]");
+                                if (delete)
+                                {
+                                    await client.DeleteMessages(channel, message.ID);
+                                    Utilities.WriteLogToFile(errorLogFilePath,
+                                        $"Error: Message: {message.message} | Deleting Message");
+                                    logMsg =
+                                        Markup.FromInterpolated(
+                                            $"[red] Error: Delete Enabled Removing[/] | [orange1]Message: {message.message}[/]");
+                                }
+                                else
+                                {
+                                    Utilities.WriteLogToFile(errorLogFilePath,
+                                        $"Error: {link.link} | Message: {message.message}");
+                                }
+
+                                logs = AddLog(logs, logMsg);
+                                table = BuildTable(
+                                    table,
+                                    logs,
+                                    totalGroupFiles,
+                                    downloadedFiles,
+                                    duplicateFiles,
+                                    filteredFiles,
+                                    existingFiles,
+                                    erroredFiles);
+                                ctx.Refresh();
+                                continue;
+                            }
+
+                            var sanitizedName = SubString(RemoveNewlinesFromPath(fileName)) + ext;
+                            var info = new FileInfo(config.DownloadPath + $"/{sanitizedName}");
+                            var wanted = config.DocumentExtensionFilter!.Split(",");
+                            if (wanted.Length > 0 && !wanted.Contains(info.Extension.Replace(".", "").ToLower()))
+                            {
+                                filteredFiles++;
+                                var link = await client.Channels_ExportMessageLink(channel, msg.ID);
+                                Utilities.WriteLogToFile(filteredLogFilePath, $"{info.Name} | {link.link}");
+                                logs = AddLog(logs,
+                                    Markup.FromInterpolated($"Skipping Filtered: {link.link} | [red]{sanitizedName}[/]"));
+                                table = BuildTable(
+                                    table,
+                                    logs,
+                                    totalGroupFiles,
+                                    downloadedFiles,
+                                    duplicateFiles,
+                                    filteredFiles,
+                                    existingFiles,
+                                    erroredFiles);
+                                ctx.Refresh();
+                                continue;
+                            }
+
+                            var choice = await DocumentManager.DecidePreDownload(info, docId, size);
+                            switch (choice)
+                            {
+                                case PreDownloadProcessingDecision.Update:
+                                    {
+                                        await using var db = new DocumentContext();
+                                        var uHash = GetFileHash(info.FullName);
+                                        if (await db.DocumentFiles.AnyAsync(x => x.Hash == uHash))
+                                            break;
+                                        await db.DocumentFiles.AddAsync(new DocumentFile()
+                                        {
+                                            Name = info.Name,
+                                            Extension = info.Extension.Remove(0, 1),
+                                            FullName = info.FullName,
+                                            Hash = GetFileHash(info.FullName),
+                                            TelegramId = docId
+                                        });
+                                        await db.SaveChangesAsync();
+                                        totalBytes += info.Length;
+                                        existingFiles++;
+                                        logs = AddLog(logs,
+                                            Markup.FromInterpolated($"Updating Existing: [green]{sanitizedName}[/]"));
+                                        table = BuildTable(
+                                            table,
+                                            logs,
+                                            totalGroupFiles,
+                                            downloadedFiles,
+                                            duplicateFiles,
+                                            filteredFiles,
+                                            existingFiles,
+                                            erroredFiles);
+                                        ctx.Refresh();
+                                        continue;
+                                    }
+                                case PreDownloadProcessingDecision.Nothing:
+                                    totalBytes += size;
+                                    existingFiles++;
+                                    logs = AddLog(logs,
+                                        Markup.FromInterpolated($"Skipping Existing: [green]{sanitizedName}[/]"));
+                                    table = BuildTable(
+                                        table,
+                                        logs,
+                                        totalGroupFiles,
+                                        downloadedFiles,
+                                        duplicateFiles,
+                                        filteredFiles,
+                                        existingFiles,
+                                        erroredFiles);
+                                    ctx.Refresh();
+                                    continue;
+                                case PreDownloadProcessingDecision.ExistingDuplicate:
+                                    {
+                                        duplicateFiles++;
+                                        await using var dupeDb = new DocumentContext();
+                                        var existing = await dupeDb.DuplicateFiles.FirstAsync(x => x.TelegramId == docId);
+                                        var link = await client.Channels_ExportMessageLink(channel, msg.ID);
+                                        Utilities.WriteLogToFile(duplicateLogFilePath,
+                                            $"{sanitizedName},{existing.OrignalName},{link.link}");
+                                        logs = AddLog(logs,
+                                            Markup.FromInterpolated(
+                                                $"Existing Duplicate: {link.link} | [red]{sanitizedName}[/] is duplicate of [green]{existing.OrignalName}[/]"));
+                                        table = BuildTable(
+                                            table,
+                                            logs,
+                                            totalGroupFiles,
+                                            downloadedFiles,
+                                            duplicateFiles,
+                                            filteredFiles,
+                                            existingFiles,
+                                            erroredFiles);
+                                        ctx.Refresh();
+                                        continue;
+                                    }
+                            }
+
+                            switch (choice)
+                            {
+                                case PreDownloadProcessingDecision.ReDownload:
+                                    logs = AddLog(logs,
+                                        Markup.FromInterpolated(
+                                            $"Re-downloading Partially Downloaded: [yellow] {sanitizedName}[/]"));
+                                    table = BuildTable(
+                                        table,
+                                        logs,
+                                        totalGroupFiles,
+                                        downloadedFiles,
+                                        duplicateFiles,
+                                        filteredFiles,
+                                        existingFiles,
+                                        erroredFiles);
+                                    ctx.Refresh();
+                                    break;
+                                case PreDownloadProcessingDecision.SaveAndDownload:
+                                    logs = AddLog(logs, Markup.FromInterpolated($"Downloading: [yellow] {sanitizedName}[/]"));
+                                    table = BuildTable(
+                                        table,
+                                        logs,
+                                        totalGroupFiles,
+                                        downloadedFiles,
+                                        duplicateFiles,
+                                        filteredFiles,
+                                        existingFiles,
+                                        erroredFiles);
+                                    ctx.Refresh();
+                                    break;
+                            }
+
+                            try
+                            {
+                                await using var fs = info.Create();
+                                if (document is Document tempDoc)
+                                    await client.DownloadFileAsync(tempDoc, fs);
+                                else if (document is Photo tempPhoto)
+                                    await client.DownloadFileAsync(tempPhoto, fs);
+                                fs.Close();
+                            }
+                            catch (RpcException e)
+                            {
+                                erroredFiles++;
+                                var errorMessage = Markup.FromInterpolated(
+                                    $"Download Error: {e.Message} - [red]{sanitizedName}[/]");
+                                var link = await client.Channels_ExportMessageLink(channel, msg.ID);
+                                Utilities.WriteLogToFile(errorLogFilePath, $"{link.link} | {sanitizedName} - {e.Message}");
+                                logs = AddLog(logs, errorMessage);
+                                table = BuildTable(
+                                    table,
+                                    logs,
+                                    totalGroupFiles,
+                                    downloadedFiles,
+                                    duplicateFiles,
+                                    filteredFiles,
+                                    existingFiles,
+                                    erroredFiles);
+                                ctx.Refresh();
+                                continue;
+                            }
+
+                            var hash = GetFileHash(info.FullName);
+                            var postChoice = await DocumentManager.DecidePostDownload(info, hash);
+                            await using var context = new DocumentContext();
+                            if (postChoice == PostDownloadProcessingDecision.ProcessDuplicate)
+                            {
+                                var dbFile = context.DocumentFiles.First(x => x.Hash == hash);
+                                if (!context.DuplicateFiles.Any(x => x.TelegramId == docId))
+                                {
+                                    context.DuplicateFiles.Add(new DuplicateFile()
+                                    {
+                                        OrignalName = dbFile.Name,
+                                        DuplicateName = sanitizedName,
+                                        Hash = hash,
+                                        TelegramId = docId
+                                    });
+                                    await context.SaveChangesAsync();
+                                }
+
+                                info.Delete();
+                                duplicateFiles++;
+                                var link = await client.Channels_ExportMessageLink(channel, msg.ID);
+                                Utilities.WriteLogToFile(duplicateLogFilePath, $"{sanitizedName},{dbFile.Name}, {link.link}");
+                                logs = AddLog(logs,
+                                    Markup.FromInterpolated(
+                                        $"Cleaned Up:[red] {sanitizedName}[/] is duplicate of [green] {dbFile.Name}[/]"));
+                                table = BuildTable(
+                                    table,
+                                    logs,
+                                    totalGroupFiles,
+                                    downloadedFiles,
+                                    duplicateFiles,
+                                    filteredFiles,
+                                    existingFiles,
+                                    erroredFiles);
+                                ctx.Refresh();
+                                continue;
+                            }
+
+                            var doc = new DocumentFile()
                             {
                                 Name = info.Name,
-                                Extension = info.Extension.Remove(0, 1),
-                                FullName = info.FullName,
-                                Hash = GetFileHash(info.FullName),
-                                TelegramId = document.ID
-                            });
-                            await db.SaveChangesAsync();
-                            totalBytes += info.Length;
-                            existingFiles++;
-                            logs = AddLog(logs,
-                                Markup.FromInterpolated($"Updating Existing: [green]{sanitizedName}[/]"));
-                            table = BuildTable(
-                                table,
-                                logs,
-                                totalGroupFiles,
-                                downloadedFiles,
-                                duplicateFiles,
-                                filteredFiles,
-                                existingFiles,
-                                erroredFiles);
-                            ctx.Refresh();
-                            continue;
-                        }
-                        case PreDownloadProcessingDecision.Nothing:
-                            totalBytes += document.size;
-                            existingFiles++;
-                            logs = AddLog(logs,
-                                Markup.FromInterpolated($"Skipping Existing: [green]{sanitizedName}[/]"));
-                            table = BuildTable(
-                                table,
-                                logs,
-                                totalGroupFiles,
-                                downloadedFiles,
-                                duplicateFiles,
-                                filteredFiles,
-                                existingFiles,
-                                erroredFiles);
-                            ctx.Refresh();
-                            continue;
-                        case PreDownloadProcessingDecision.ExistingDuplicate:
-                        {
-                            duplicateFiles++;
-                            await using var dupeDb = new DocumentContext();
-                            var existing = await dupeDb.DuplicateFiles.FirstAsync(x => x.TelegramId == document.ID);
-                            var link = await client.Channels_ExportMessageLink(channel, msg.ID);
-                            Utilities.WriteLogToFile(duplicateLogFilePath,
-                                $"{sanitizedName},{existing.OrignalName},{link.link}");
-                            logs = AddLog(logs,
-                                Markup.FromInterpolated(
-                                    $"Existing Duplicate: {link.link} | [red]{sanitizedName}[/] is duplicate of [green]{existing.OrignalName}[/]"));
-                            table = BuildTable(
-                                table,
-                                logs,
-                                totalGroupFiles,
-                                downloadedFiles,
-                                duplicateFiles,
-                                filteredFiles,
-                                existingFiles,
-                                erroredFiles);
-                            ctx.Refresh();
-                            continue;
-                        }
-                    }
-
-                    switch (choice)
-                    {
-                        case PreDownloadProcessingDecision.ReDownload:
-                            logs = AddLog(logs,
-                                Markup.FromInterpolated(
-                                    $"Re-downloading Partially Downloaded: [yellow] {sanitizedName}[/]"));
-                            table = BuildTable(
-                                table,
-                                logs,
-                                totalGroupFiles,
-                                downloadedFiles,
-                                duplicateFiles,
-                                filteredFiles,
-                                existingFiles,
-                                erroredFiles);
-                            ctx.Refresh();
-                            break;
-                        case PreDownloadProcessingDecision.SaveAndDownload:
-                            logs = AddLog(logs, Markup.FromInterpolated($"Downloading: [yellow] {sanitizedName}[/]"));
-                            table = BuildTable(
-                                table,
-                                logs,
-                                totalGroupFiles,
-                                downloadedFiles,
-                                duplicateFiles,
-                                filteredFiles,
-                                existingFiles,
-                                erroredFiles);
-                            ctx.Refresh();
-                            break;
-                    }
-
-                    try
-                    {
-                        await using var fs = info.Create();
-                        await client.DownloadFileAsync(document, fs);
-                        fs.Close();
-                    }
-                    catch (RpcException e)
-                    {
-                        erroredFiles++;
-                        var errorMessage = Markup.FromInterpolated(
-                            $"Download Error: {e.Message} - [red]{sanitizedName}[/]");
-                        var link = await client.Channels_ExportMessageLink(channel, msg.ID);
-                        Utilities.WriteLogToFile(errorLogFilePath, $"{link.link} | {sanitizedName} - {e.Message}");
-                        logs = AddLog(logs, errorMessage);
-                        table = BuildTable(
-                            table,
-                            logs,
-                            totalGroupFiles,
-                            downloadedFiles,
-                            duplicateFiles,
-                            filteredFiles,
-                            existingFiles,
-                            erroredFiles);
-                        ctx.Refresh();
-                        continue;
-                    }
-
-                    var hash = GetFileHash(info.FullName);
-                    var postChoice = await DocumentManager.DecidePostDownload(info, hash);
-                    await using var context = new DocumentContext();
-                    if (postChoice == PostDownloadProcessingDecision.ProcessDuplicate)
-                    {
-                        var dbFile = context.DocumentFiles.First(x => x.Hash == hash);
-                        if (!context.DuplicateFiles.Any(x => x.TelegramId == document.ID))
-                        {
-                            context.DuplicateFiles.Add(new DuplicateFile()
-                            {
-                                OrignalName = dbFile.Name,
-                                DuplicateName = sanitizedName,
+                                Extension = info.Extension.Replace(".", ""),
                                 Hash = hash,
-                                TelegramId = document.ID
-                            });
+                                FullName = info.FullName,
+                                TelegramId = docId
+                            };
+                            context.DocumentFiles.Add(doc);
                             await context.SaveChangesAsync();
+                            downloadedBytes += info.Length;
+                            totalBytes += info.Length;
+                            downloadedFiles++;
+                            logs = AddLog(logs,
+                                Markup.FromInterpolated($"Downloaded:[green bold] {sanitizedName}[/]"));
+                            table = BuildTable(
+                                table,
+                                logs,
+                                totalGroupFiles,
+                                downloadedFiles,
+                                duplicateFiles,
+                                filteredFiles,
+                                existingFiles,
+                                erroredFiles);
+                            ctx.Refresh();
                         }
-
-                        info.Delete();
-                        duplicateFiles++;
-                        var link = await client.Channels_ExportMessageLink(channel, msg.ID);
-                        Utilities.WriteLogToFile(duplicateLogFilePath, $"{sanitizedName},{dbFile.Name}, {link.link}");
-                        logs = AddLog(logs,
-                            Markup.FromInterpolated(
-                                $"Cleaned Up:[red] {sanitizedName}[/] is duplicate of [green] {dbFile.Name}[/]"));
-                        table = BuildTable(
-                            table,
-                            logs,
-                            totalGroupFiles,
-                            downloadedFiles,
-                            duplicateFiles,
-                            filteredFiles,
-                            existingFiles,
-                            erroredFiles);
-                        ctx.Refresh();
-                        continue;
                     }
-
-                    var doc = new DocumentFile()
-                    {
-                        Name = info.Name,
-                        Extension = info.Extension.Replace(".", ""),
-                        Hash = hash,
-                        FullName = info.FullName,
-                        TelegramId = document.ID
-                    };
-                    context.DocumentFiles.Add(doc);
-                    await context.SaveChangesAsync();
-                    downloadedBytes += info.Length;
-                    totalBytes += info.Length;
-                    downloadedFiles++;
-                    logs = AddLog(logs,
-                        Markup.FromInterpolated($"Downloaded:[green bold] {RemoveNewlinesFromPath(sanitizedName)}[/]"));
-                    table = BuildTable(
-                        table,
-                        logs,
-                        totalGroupFiles,
-                        downloadedFiles,
-                        duplicateFiles,
-                        filteredFiles,
-                        existingFiles,
-                        erroredFiles);
-                    ctx.Refresh();
                 }
             }
         });
@@ -520,6 +604,20 @@ static string RemoveNewlinesFromPath(string value)
                 break;
             case '*':
                 break;
+            case '/':
+                break;
+            case '\\':
+                break;
+            case '?':
+                break;
+            case '"':
+                break;
+            case '>':
+                break;
+            case '<':
+                break;
+            case '|':
+                break;
             default:
                 validCharacters[next++] = c;
                 break;
@@ -527,6 +625,37 @@ static string RemoveNewlinesFromPath(string value)
     }
 
     return new string(validCharacters, 0, next).Trim();
+}
+
+static string SubString(string text)
+{
+    var limitSize = 260 - 5;
+    byte[] bytes = Encoding.Unicode.GetBytes(text);
+    int nByte = 0;
+    int i = 0;
+    for (; i < bytes.GetLength(0) && nByte < limitSize; i++)
+    {
+        if (i % 2 == 0)
+        {
+            nByte++;
+        }
+        else
+        {
+            if (bytes[i] > 0)
+            {
+                nByte++;
+            }
+        }
+    }
+
+    if (i % 2 == 1)
+    {
+        if (bytes[i] > 0)
+            i--;
+        else
+            i++;
+    }
+    return Encoding.Unicode.GetString(bytes, 0, i);
 }
 
 static Table BuildTable(Table table,
@@ -563,4 +692,15 @@ static List<Markup> AddLog(List<Markup> list, Markup markup, bool removeOld = tr
         list.Remove(list[0]);
     list.Add(markup);
     return list;
+}
+
+static async Task<int> getMsgFilterCount(string searchKey, WTelegram.Client client, InputPeerChannel channel, MessagesFilter messagesFilter, string fileType, Dictionary<MessagesFilter, int> dicMsg)
+{
+    var photoMsgs = await client.Messages_Search(channel, searchKey, messagesFilter);
+    if (photoMsgs.Count > 0)
+    {
+        AnsiConsole.MarkupLine($"Found [green]{photoMsgs.Count}[/] {fileType}");
+        dicMsg.Add(messagesFilter, photoMsgs.Count);
+    }
+    return photoMsgs.Count;
 }

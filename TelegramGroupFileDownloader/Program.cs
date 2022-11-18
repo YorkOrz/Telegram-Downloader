@@ -142,7 +142,7 @@ try
     }
     catch (RpcException)
     {
-        AnsiConsole.MarkupLine($"Getting documents from group [yellow]{config.GroupName}[/]");
+        AnsiConsole.MarkupLine($"Getting documents from group [yellow]{group.Title}[/]");
         delete = false;
     }
 
@@ -213,7 +213,7 @@ try
                                 }
                                 else
                                 {
-                                    ext = MimeTypesMap.GetExtension(d.mime_type);
+                                    ext = "." + MimeTypesMap.GetExtension(d.mime_type);
                                 }
                             }
                             else if (msg is Message { media: MessageMediaPhoto { photo: Photo p } })
